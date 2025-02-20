@@ -1,167 +1,207 @@
 import disnake
 from disnake.ext import commands
+import os
+import random
 import asyncio
-from langdetect import detect
-from disnake import Localized, Locale
-import json
+from utils import web_search, config
 import aiohttp
-from bs4 import BeautifulSoup
-import re
-import requests
-from googlesearch import search
+import json
+from langdetect import detect
+from disnake import Locale, Localized
 
 
-class ChatBot(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
+class ChatBotSystem:
+    def __init__(self, user_id):
+        self.token_limit = 500
+        self.user_id = user_id
 
-        self.message_limit = 2000
+        self.models = {
+            'deepseek': {
+                'model': 'deepseek/deepseek-chat',
+                'reasoning': 'deepseek/deepseek-r1:free',
+                'func': self.openrouter_generating_2,
+                'key': os.environ['OPENROUTER']
+            },
+            'qwen': {
+                'model': 'qwen/qwen-vl-plus:free',
+                'reasoning': False,
+                'func': self.openrouter_generating,
+                'key': os.environ['OPENROUTER']
+            }
+        }
+        self.current_model = random.choice([model for model, _ in self.models.items()])
 
-        self.chats = {}
+        self.messages = []
+        self.internet_search = False
+        self.google_search = False
+        self.reasoning = False
+        self.lange = None
 
-        self.model = 'deepseek/deepseek-chat'
-        self.reasoning_model = 'deepseek/deepseek-r1:free'
-        self.openrouter_api_key = "YOUR_OPENROUTER_API_KEY"
+        self.process = False
+        self.stop_command = False
 
-    def fetch_webpage_text(self, url):
-        """Получает текстовое содержимое веб-страницы."""
-        try:
-            response = requests.get(
-                url, 
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                }, 
-                timeout=10
-            )
-            response.raise_for_status()
+        self.results = {
+            'content': '',
+            'reasoning': '',
+            'embeds': [],
+            'model': self.current_model,
+        }
 
-            # Проверяем, есть ли блокировка по JavaScript
-            if "JavaScript" in response.text or "captcha" in response.text.lower():
-                return False  # Пропускаем такие сайты
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Удаляем скрипты и стили
-            for script_or_style in soup(['script', 'style']):
-                script_or_style.decompose()
-            
-            # Получаем текст
-            text = soup.get_text(separator=' ', strip=True)
-            text = re.sub(r'\s+', ' ', text)  # Убираем лишние пробелы
-            return text[:997] + '...' if len(text) > 1000 else text
-        except Exception:
-            return False
+    def clear_results(self):
+        self.results = {
+            'content': '',
+            'reasoning': '',
+            'embeds': [],
+            'model': self.current_model,
+        }
 
-    def search_and_extract(self, query, num_results=3):
-        """Ищет в Google и извлекает текст с сайтов."""
-        results = []
+    def get_results(self):
+        return self.results
+
+    async def generate(self, content, regenerate=False):
+        self.process = True
+
+        if regenerate:
+            self.messages.pop(-1)
+            if self.messages[-1]['role'] == 'system':
+                self.messages.pop(-1)
+
+        if not self.lange and content:
+            try:
+                lange = detect(content)
+                self.lange = lange if lange in ['ru', 'en'] else 'ru'
+            except:
+                self.lange = random.choice(['ru', 'en'])
         
-        for link in search(query, num_results=num_results):
-            text = self.fetch_webpage_text(link)
-            if text:
-                results.append(f"**website:** {link}\n**extracted text:** {text}\n")
-                
-        if results:
-            return "\n".join(results)
-        else:
-            return 'not found'
+        asyncio.create_task(self.models[self.current_model]['func'](content))
+        return self.process
 
-    async def components(self, user_id):
-        return [
-            disnake.ui.Button(
-                label='🔎',
-                style=disnake.ButtonStyle.blurple if self.chats[user_id]['web_search'] else disnake.ButtonStyle.grey,
-                custom_id=f'chatbot_websearch_{user_id}'
-            ),
-            disnake.ui.Button(
-                label='R1',
-                style=disnake.ButtonStyle.blurple if self.chats[user_id]['r1'] else disnake.ButtonStyle.grey,
-                custom_id=f'chatbot_r1_{user_id}'
-            ),
-            disnake.ui.Button(
-                label='⬜',
-                style=disnake.ButtonStyle.red,
-                custom_id=f'chatbot_stop_{user_id}'
-            )
-        ]
-        
-    async def check(self, message):
-        guild = message.guild
-        ctx = message.content
+    def change_model(self, model):
+        if model in self.models:
+            self.current_model = model
 
-        if message.guild:
-            if message.channel.is_nsfw():
-                return False
-        
-        if (ctx.replace(' ', '') if ' ' in ctx else ctx) == self.bot.user.mention:
-            return False
-        
-        if not message.guild and not message.author.bot:
-            return True
+    def stop(self):
+        self.stop_command = True
 
-        if self.bot.user.mentioned_in(message):
-            if message.mentions:
-                if len(message.mentions) > 1:
-                    return False
-
-                required_permissions = disnake.Permissions(
-                    view_channel=True,
-                    send_messages=True
-                )
-                guild = message.guild
-
-                if not guild.me.guild_permissions.is_superset(required_permissions):
-                    return False
+    def change_reasoning(self):
+        if not self.reasoning:
+            if self.models[self.current_model]['reasoning']:
+                self.reasoning = True
 
                 return True
             else:
-                return True
-        return False
+                return False
+        else:
+            self.reasoning = False
+            return True
+        
+    def enable_internet_search(self, google_search=False, internet_search=False):
+        if internet_search:
+            self.internet_search = not self.internet_search
+            if google_search:
+                self.google_search = False
+        elif google_search:
+            self.google_search = not self.google_search
+            if internet_search:
+                self.internet_search = False
 
-    async def create_chat(self, user_id):
-        self.chats[user_id] = {
-            "messages": [],
-            "web_search": False,
-            "r1": False,
-            "in_progress": False,
-            "embeds": [],
-            "content": None,
-            "thinks": None,
-            "stop": False
-        }
+    def get_components(self):
+        models_list = []
+        for key, _ in self.models.items():
+            models_list.append(disnake.SelectOption(label=key, value=key)),
+        
+        if not self.process:
+            cmp_list = [
+                disnake.ui.Button(
+                    emoji='<:google:1339203500558520351>',
+                    style=disnake.ButtonStyle.blurple if self.google_search else disnake.ButtonStyle.grey,
+                    custom_id=f'chatbot_google_{self.user_id}'
+                ),
+                disnake.ui.Button(
+                    emoji='<:search:1339218256866840586>',
+                    style=disnake.ButtonStyle.blurple if self.internet_search else disnake.ButtonStyle.grey,
+                    custom_id=f'chatbot_websearch_{self.user_id}'
+                ),
+                disnake.ui.Button(
+                    emoji='🧠',
+                    style=disnake.ButtonStyle.blurple if self.reasoning else disnake.ButtonStyle.grey,
+                    custom_id=f'chatbot_reasoning_{self.user_id}'
+                ),
+                disnake.ui.Button(
+                    emoji='<:restart:1339218430523609128>',
+                    style=disnake.ButtonStyle.gray,
+                    custom_id=f'chatbot_regenerate_{self.user_id}'
+                ),
+                disnake.ui.Button(
+                    label='отчистить чат' if self.lange == 'ru' else 'clear chat',
+                    style=disnake.ButtonStyle.red,
+                    custom_id=f'chatbot_clear_{self.user_id}'
+                ),
+                disnake.ui.Select(
+                    placeholder=self.current_model,
+                    options=models_list,
+                    custom_id=f'chatbot_model_{self.user_id}'
+                ),
+            ]
+        else:
+            cmp_list = [
+                disnake.ui.Button(
+                    emoji='⬜',
+                    style=disnake.ButtonStyle.red,
+                    custom_id=f'chatbot_stop_{self.user_id}'
+                ),
+                disnake.ui.Button(
+                    label='проверить' if self.lange == 'ru' else 'check',
+                    style=disnake.ButtonStyle.success,
+                    custom_id=f'chatbot_check_{self.user_id}'
+                )
+            ]
+        
+        return cmp_list
 
-    async def generating(self, user_id, content, lange):
-        self.chats[user_id]['in_progress'] = True
-        self.chats[user_id]['messages'].append({"role": "user", "content": content})
+    async def web_search(self, content):
+        if self.internet_search or self.google_search:
+            icon = 'https://lh3.googleusercontent.com/COxitqgJr1sJnIDe8-jiKhxDx1FrYbtRHKJ9z_hELisAlapwE9LUPh6fcXIfb5vwpbMl4xl9H9TRFPc5NOO8Sb3VSgIBrfRYvW6cUA'
+            if self.internet_search:
+                result = web_search.lange_search(content)
+                icon = 'https://cdn-icons-png.flaticon.com/512/1011/1011322.png'
+            elif self.google_search:
+                self.google_search = not self.google_search
+                result = web_search.google_search(content)
 
-        if self.chats[user_id]['web_search']:
-            result = self.search_and_extract(content)
-            self.chats[user_id]['messages'].append({"role": "user", "system": "web search results:\n" + str(result)})
-            self.chats[user_id]['embeds'].append(
+            self.messages.append({"role": "user", "system": "web search results (the user has enabled web search):\n" + str(result)})
+            self.results['embeds'].append(
                 disnake.Embed(
-                    title='веб поиск' if lange == 'ru' else 'web search',
+                    title='веб поиск' if self.lange == 'ru' else 'web search',
                     description=str(result)[:1997] + '...' if len(result) > 2000 else str(result)
-                ).set_thumbnail('https://lh3.googleusercontent.com/COxitqgJr1sJnIDe8-jiKhxDx1FrYbtRHKJ9z_hELisAlapwE9LUPh6fcXIfb5vwpbMl4xl9H9TRFPc5NOO8Sb3VSgIBrfRYvW6cUA')
+                ).set_thumbnail(icon)
             )
 
+    async def openrouter_generating(self, content):
+        if content:
+            self.messages.append({"role": "user", "content": content})
+            
+        await self.web_search(content)
+
+        model = self.models[self.current_model]['reasoning'] if (self.reasoning and self.models[self.current_model]['reasoning']) else self.models[self.current_model]['model']
         url = "https://openrouter.ai/api/v1/chat/completions"
         headers = {
-            "Authorization": f"Bearer {self.openrouter_api_key}",
+            "Authorization": f"Bearer {self.models[self.current_model]['key']}",
             "Content-Type": "application/json"
         }
-        payload = {
-            "model": self.reasoning_model if self.chats[user_id]['r1'] else self.model,
-            "messages": self.chats[user_id]['messages'],
-            "include_reasoning": self.chats[user_id]['r1'],
-            "stream": True,
-        }
-
+        data=json.dumps({
+            "model": model,
+            "messages": self.messages,
+            "include_reasoning": self.reasoning,
+            "max_tokens": self.token_limit,
+            "stream": True, 
+        })
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=headers, json=payload) as response:
+                async with session.post(url, headers=headers, data=data) as response:
                     async for line in response.content:
-                        if self.chats[user_id]['stop']:
-                            self.chats[user_id]['stop'] = False
+                        if self.stop_command:
+                            self.stop_command = False
                             break
 
                         decoded_line = line.decode('utf-8').strip()
@@ -169,112 +209,157 @@ class ChatBot(commands.Cog):
                             try:
                                 json_data = json.loads(decoded_line[5:])
                                 if 'error' in json_data:
-                                    self.chats[user_id]['content'] = 'error: ' + json_data['error']['message']
+                                    self.results['content'] = 'error: ' + json_data['error']['message']
                                     break
 
                                 content = json_data.get("choices", [{}])[0].get("delta", {}).get("content", "")
                                 reasoning = json_data.get("choices", [{}])[0].get("delta", {}).get("reasoning", "")
 
                                 if content:
-                                    self.chats[user_id]['content'] = (self.chats[user_id]['content'] or "") + content
+                                    self.results['content'] += content
                                 if reasoning:
-                                    self.chats[user_id]['thinks'] = (self.chats[user_id]['thinks'] or "") + reasoning
-
+                                    self.results['reasoning'] += reasoning
                             except json.JSONDecodeError:
                                 pass
         except Exception as e:
-            self.chats[user_id]['content'] = f"error: {e}"
+            self.results['content'] = f"error: {e}"
 
-        self.chats[user_id]['messages'].append(
+        self.messages.append(
             {
-                "role": "assistant", "content": (
-                    self.chats[user_id]['content'] + 
-                    'system: your reasoning:\n' + str(self.chats[user_id]['thinks']) if self.chats[user_id]['content'] else self.chats[user_id]['content']
-                )
+                "role": "assistant", "content": (self.results['content'] + 'system: your reasoning:\n' + str(self.results['reasoning']) if self.results['reasoning'] else self.results['content'])
             }
         )
-        self.chats[user_id]['in_progress'] = False
+        self.process = False
 
-    async def message_edit(self, message, user_id, lange, bot_message):
-        if self.chats[user_id]['r1']:
-            await bot_message.edit(
-                (str(self.chats[user_id]['content'])[:2000] if len(self.chats[user_id]['content']) > 2000 else str(self.chats[user_id]['content'])) if self.chats[user_id]['content'] else '...', 
-                embeds=[
-                    disnake.Embed(
-                        title='глубокое размышление' if lange == 'ru' else 'deep think',
-                        description=(str(self.chats[user_id]['thinks'])[:2000] if len(self.chats[user_id]['thinks']) > 2000 else str(self.chats[user_id]['thinks'])) if (self.chats[user_id]['thinks'] and not str(self.chats[user_id]['thinks']).replace(' ', '') == '') else '...'
-                    ),
-                    *self.chats[user_id]["embeds"]
-                ],
-                components=await self.components(user_id)
-            )
-        else:
-            await bot_message.edit(
-                (str(self.chats[user_id]['content'])[:2000] if len(self.chats[user_id]['content']) > 2000 else str(self.chats[user_id]['content'])) if self.chats[user_id]['content'] else '...', 
-                embeds=self.chats[user_id]["embeds"], 
-                components=await self.components(user_id)
-            )
+    async def openrouter_generating_2(self, content):
+        if content:
+            self.messages.append({"role": "user", "content": content})
+            
+        await self.web_search(content)
 
-    async def message(self, user_id, message, lange):
-        while self.chats[user_id]["content"] is None and self.chats[user_id]["thinks"] is None:
-            await asyncio.sleep(1)
-        bot_message = await message.channel.send('...', reference=message)
-        
-        while self.chats[user_id]['in_progress']:
-            await self.message_edit(message, user_id, lange, bot_message)
+        model = self.models[self.current_model]['reasoning'] if (self.reasoning and self.models[self.current_model]['reasoning']) else self.models[self.current_model]['model']
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.models[self.current_model]['key']}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": model,
+            "messages": self.messages,
+            "include_reasoning": self.reasoning,
+            "max_tokens": self.token_limit,
+            "stream": True,
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=payload) as response:
+                    async for line in response.content:
+                        if self.stop_command:
+                            self.stop_command = False
+                            break
 
-            await asyncio.sleep(1)
+                        decoded_line = line.decode('utf-8').strip()
+                        if decoded_line.startswith('data:'):
+                            try:
+                                json_data = json.loads(decoded_line[5:])
+                                if 'error' in json_data:
+                                    self.results['content'] = 'error: ' + json_data['error']['message']
+                                    break
 
-        await self.message_edit(message, user_id, lange, bot_message)
+                                content = json_data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                                reasoning = json_data.get("choices", [{}])[0].get("delta", {}).get("reasoning", "")
 
-        self.chats[user_id]['content'] = None
-        self.chats[user_id]['thinks'] = None
-        self.chats[user_id]['embeds'] = []
+                                if content:
+                                    self.results['content'] += content
+                                if reasoning:
+                                    self.results['reasoning'] += reasoning
+                            except json.JSONDecodeError:
+                                pass
+        except Exception as e:
+            self.results['content'] = f"error: {e}"
 
-    async def starter(self, user_id, message, lange, content):
-        if not user_id in self.chats:
-            await self.create_chat(user_id)
+        self.messages.append(
+            {
+                "role": "assistant", "content": (self.results['content'] + 'system: your reasoning:\n' + str(self.results['reasoning']) if self.results['reasoning'] else self.results['content'])
+            }
+        )
+        self.process = False
 
-        if self.chats[user_id]["in_progress"]:
-            while self.chats[user_id]["in_progress"]:
-                await asyncio.sleep(1)
 
-        asyncio.create_task(self.generating(user_id, content, lange))
-        asyncio.create_task(self.message(user_id, message, lange))
+class ChatBot(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.chats = {}
 
-    @commands.Cog.listener()
-    async def on_message(self, message):
-        user_id = message.author.id
-        content = message.content
-
-        if self.bot.user.mention:
-            content = content.replace(self.bot.user.mention, '')
-
-        if await self.check(message):
-
-            try:
-                lange = detect(content)
-            except Exception:
-                lange = 'eu'
-
-            async with message.channel.typing():
-                try:
-                    await self.starter(user_id, message, lange, content)
-                except Exception as e:
-                    await message.channel.send(
-                        embed=disnake.Embed(
-                            title='ошибка' if lange == 'ru' else 'error',
-                            description=e,
-                            color=disnake.Color.red()
-                        ),
-                        reference=message
-                    )
-                    if user_id in self.chats:
-                        del self.chats[user_id]
+    async def check(self, message) -> bool:
+        # ну тут короче сами делайте что нужно
+        if not message.guild:
             return True
+            
+        if not content.replace(" ", "").replace(self.bot.user.mention, ""):
+            return False
         
+        if message.mentions and len(message.mentions) > 2:
+            return False
+        if not message.channel.is_nsfw():
+            return True
+            
         return False
         
+    async def main(self, chat, message, user_id, content=True):
+        while chat.process:
+            await asyncio.sleep(1)
+
+        chat.process = True
+
+        asyncio.create_task(chat.generate(
+                message.content.replace(self.bot.user.mention, '') if content else False
+            )
+        )
+
+        bot_message = await message.channel.send('...', reference=message)
+
+        while chat.process:
+            await asyncio.sleep(1)
+            await self.message(bot_message, user_id)
+
+        await self.message(bot_message, user_id)
+
+        chat.clear_results()
+        print(self.chats[user_id].messages)
+        return True
+
+    async def message(self, message, user_id):
+        results = self.chats[user_id].get_results()
+
+        message_content = results['content']
+        reasoning_embed = disnake.Embed(
+            title='размышления' if self.chats[user_id].get_lange() == 'ru' else 'reasoning',
+            description=results['reasoning']
+        ) if results['reasoning'] else None
+        embeds = []
+        if results['embeds']:
+            embeds.append(
+                results['embeds']
+            )
+        if reasoning_embed:
+            embeds.insert(0, reasoning_embed)
+
+        await message.edit(
+            content=message_content,
+            embeds=embeds,
+            components=self.chats[user_id].get_components()
+        )
+
+    async def on_message(self, message):
+        user_id = message.author.id
+
+        if (not message.guild or self.bot.user.mentioned_in(message)) and await self.check(message):
+            chat = self.chats.setdefault(user_id, ChatBotSystem(user_id))
+
+            result = await self.main(chat, message, user_id)
+            return result
+
     @commands.slash_command(
         name=Localized(
             'chat_bot',
@@ -288,95 +373,208 @@ class ChatBot(commands.Cog):
 
     @chat_bot.sub_command(
         name=Localized(
-            'clear_chat',
+            'manage',
             data={
-                Locale.ru: 'отчистить_чат'
+                Locale.ru: 'управлять'
             }
         ),
         description=Localized(
-            'delete your chat with the bot',
+            'manage a chat with a bot (emergency actions)',
             data={
-                Locale.ru: 'удалите ваш чат с ботом',
+                Locale.ru: 'управлять чатом с ботом (экстренные действия)',
             }
         ),
     )
-    async def chat_bot_clear(
-            self,
-            inter
+    async def chat_bot_manage(
+        self,
+        inter,
+        action: bool = commands.Param(
+            name=Localized('action', data={Locale.ru: 'действие'}),
+            choices=[
+                disnake.OptionChoice(Localized('stop', data={Locale.ru: 'остановить'}), 'stop'),
+                disnake.OptionChoice(Localized('delete_chat', data={Locale.ru: 'удалить_чат'}), 'delete_chat'),
+                disnake.OptionChoice(Localized('check', data={Locale.ru: 'проверить'}), 'check'),
+            ],
+            default=False
+        ),
     ):
-        async def handler():
-            if inter.user.id in self.chats:
-                del self.chats[inter.user.id]
-                
+        chat = self.chats.setdefault(inter.author.id, ChatBotSystem(inter.author.id))
+
+        locale = inter.locale
+        ru = Locale.ru
+
+        if action == 'stop':
+            chat.stop()
+            await inter.send('остановлено' if inter.locale == Locale.ru else 'stopped', ephemeral=True)
+        elif action == 'delete_chat':
+            del self.chats[inter.author.id]
+            await inter.send('чат удален' if inter.locale == Locale.ru else 'chat deleted', ephemeral=True)
+        elif action == 'check':
+            status = chat.check_process()
             await inter.send(
-                embed=disnake.Embed(
-                    title='чат бот' if inter.locale == Locale.ru else 'chat bot',
-                    description='чат отчищен' if inter.locale == disnake.Locale.ru else 'the chat has been cleared',
-                    color=disnake.Color.green()
-                ),
+                ('✅ процесс активен' if status else '❌ процесс не активен') if locale == ru else ('✅ process active' if status else '❌ process not active'),
                 ephemeral=True
             )
 
-        await asyncio.create_task(handler())        
-    
+    @commands.guild_only()
+    @commands.has_permissions(administrator=True)
+    @chat_bot.sub_command(
+        name=Localized(
+            'config',
+            data={
+                Locale.ru: 'конфиг'
+            }
+        ),
+        description=Localized(
+            'chat bot config',
+            data={
+                Locale.ru: 'конфиг чат бота',
+            }
+        ),
+    )
+    async def chat_bot_config(
+        self,
+        inter
+    ):
+        locale = inter.locale
+
+        embed, components = self.config_components(inter, locale)
+
+        await inter.send(
+            embed=embed,
+            components=components
+        )
+
     @commands.Cog.listener()
     async def on_button_click(self, inter):
         if inter.message.author != self.bot.user:
             return
-        
+
         locale = inter.locale
+        ru = Locale.ru
+        inter_user_id = inter.author.id
+        custom_id = inter.data.custom_id
 
-        if inter.data.custom_id.startswith('chatbot'):
-            user_id = int(inter.data.custom_id.split('_')[2])
-            if user_id in self.chats:
-                if inter.user.id == user_id:
-                    if inter.data.custom_id.startswith('chatbot_websearch'):
-                        
-                        self.chats[user_id]['web_search'] = not self.chats[user_id]['web_search']
+        elif custom_id.startswith('chatbot'):
+            user_id = int(custom_id.split('_')[2])
 
-                        await inter.message.edit(components=await self.components(user_id))
-
-                        await inter.send(
-                            'поиск в гугле' if locale == Locale.ru else 'google search',
-                            ephemeral=True
-                        )
-
-                    elif inter.data.custom_id.startswith('chatbot_r1'):
-                        self.chats[user_id]['r1'] = not self.chats[user_id]['r1']
-
-                        await inter.message.edit(components=await self.components(user_id))
-
-                        await inter.send(
-                            'DeepThink (R1)',
-                            ephemeral=True
-                        )
-                    elif inter.data.custom_id.startswith('chatbot_stop'):
-                        if self.chats[user_id]['content'] or self.chats[user_id]['in_progress']:
-                            self.chats[user_id]['stop'] = True
-
-                            if self.chats[user_id]['content']:
-                                self.chats[user_id]['content'] += '... `system:` user stopped generation'
-
-                            await inter.send(
-                                'генерация остановлена' if locale == Locale.ru else 'generation stopped',
-                                ephemeral=True
-                            )
-                        else:
-                            await inter.send(
-                                'нет процесса генерации' if locale == Locale.ru else 'there is no generation process',
-                                ephemeral=True
-                            )
-                else:
-                    await inter.send(
-                        'ты не можешь изменять чужие параметры' if locale == Locale.ru else 'you cannot change other users parameters',
-                        ephemeral=True
-                    )
-                
-            else:
+            if user_id != inter_user_id:
                 await inter.send(
-                    'не найден чат' if locale == Locale.ru else 'chat not found',
+                    'это не твои параметры' if locale == ru else 'this is not your parameters',
                     ephemeral=True
                 )
+                return
+            if user_id not in self.chats:
+                await inter.send(
+                    'чат не найден' if locale == ru else 'chat not found',
+                    ephemeral=True
+                )
+                return
+
+            chat = self.chats.setdefault(user_id, ChatBotSystem(user_id))      
+
+            if custom_id.startswith('chatbot_stop'):
+                chat.stop()
+                await inter.send(
+                    'остановлено' if locale == ru else 'stopped',
+                    ephemeral=True
+                )
+            elif custom_id.startswith('chatbot_check'):
+                status = chat.process
+                await inter.send(
+                    ('✅ процесс активен' if status else '❌ процесс не активен') if locale == ru else ('✅ process active' if status else '❌ process not active'),
+                    ephemeral=True
+                )
+            # пошло все что не для активного процесса
+            elif custom_id.startswith('chatbot_google'):
+                chat.enable_internet_search(google_search=True)
+                await inter.message.edit(
+                    components=chat.get_components()
+                )
+                await inter.send('поиск в гугле' if locale == ru else 'google search', ephemeral=True)
+            elif custom_id.startswith('chatbot_websearch'):
+                chat.enable_internet_search(internet_search=True)
+                await inter.message.edit(
+                    components=chat.get_components()
+                )
+                await inter.send('поиск в интернете' if locale == ru else 'internet search', ephemeral=True)
+            elif custom_id.startswith('chatbot_reasoning'):
+                result = chat.change_reasoning()
+                if result:
+                    await inter.message.edit(
+                        components=chat.get_components()
+                    )
+                    await inter.send('размышления' if locale == ru else 'reasoning', ephemeral=True)
+                else:
+                    await inter.send(
+                        'модель не потдерживает размышления' if locale == ru else 'model does not support reasoning',
+                        ephemeral=True
+                    )
+            # проверка т.к. остальное не работает если активен процесс
+            if chat.process:
+                await inter.send(
+                    'процесс активен, действие невозможно'if locale == ru else 'process active, action is impossible',
+                    ephemeral=True
+                )
+                return
+            
+            if custom_id.startswith('chatbot_regenerate'):
+                if not chat.messages:
+                    await inter.send(
+                        'в чате нету сообщений' if locale == ru else 'no messages in the chat',
+                        ephemeral=True
+                    )
+                    return
+                
+                await inter.send(
+                    'запуcкаю...' if locale == ru else 'starting...',
+                    ephemeral=True
+                )
+                await chat.generate(
+                    False,
+                    regenerate=True
+                )
+                await self.main(chat, inter.message, user_id, False)
+            elif custom_id.startswith('chatbot_clear'):
+                del self.chats[user_id]
+                await inter.send(
+                    'чат удален (кнопки теперь не работают если что)' if locale == ru else 'chat deleted (the buttons dont work anymore if anything)',
+                    ephemeral=True
+                )
+                
+    @commands.Cog.listener()
+    async def on_dropdown(self, inter):
+        if inter.message.author != self.bot.user:
+            return
+        
+        locale = inter.locale
+        ru = Locale.ru
+        inter_user_id = inter.author.id
+        custom_id = inter.data.custom_id
+
+        if custom_id.startswith('chatbot'):
+            user_id = int(custom_id.split('_')[2])
+
+            if user_id != inter_user_id:
+                await inter.send(
+                    'это не твои параметры' if locale == ru else 'this is not your parameters',
+                    ephemeral=True
+                )
+                return
+
+            chat = self.chats.setdefault(user_id, ChatBotSystem(user_id))
+
+            if inter.data.custom_id.startswith('chatbot_model'):
+                model = inter.data.values[0]
+                chat.change_model(model)
+                await inter.message.edit(
+                    components=chat.get_components()
+                )
+                await inter.send(
+                    f'модель изменена - `{model}`' if locale == ru else f'model changed - `{model}`',
+                    ephemeral=True
+                )
+            
 
 def setup(bot):
-    bot.add_cog(ChatBot(bot))
+    bot.add_cog(ChatBot(bot))   
