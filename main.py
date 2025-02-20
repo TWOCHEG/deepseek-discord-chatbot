@@ -3,11 +3,14 @@ from disnake.ext import commands
 import os
 import random
 import asyncio
-from utils import web_search, config
 import aiohttp
 import json
 from langdetect import detect
 from disnake import Locale, Localized
+from bs4 import BeautifulSoup
+import re
+import requests
+from googlesearch import search
 
 
 class ChatBotSystem:
@@ -159,15 +162,80 @@ class ChatBotSystem:
         
         return cmp_list
 
+    def fetch_webpage_text(url):
+        HEADERS = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        """Получает текстовое содержимое веб-страницы."""
+        try:
+            response = requests.get(url, headers=HEADERS, timeout=10)
+            response.raise_for_status()
+    
+            # Проверяем, есть ли блокировка по JavaScript
+            if "JavaScript" in response.text or "captcha" in response.text.lower():
+                return False  # Пропускаем такие сайты
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Удаляем скрипты и стили
+            for script_or_style in soup(['script', 'style']):
+                script_or_style.decompose()
+            
+            # Получаем текст
+            text = soup.get_text(separator=' ', strip=True)
+            text = re.sub(r'\s+', ' ', text)  # Убираем лишние пробелы
+            return text[:597] + '...' if len(text) > 600 else text
+        except Exception:
+            return False
+
+    def google_search(query, num_results=3):
+        results = []
+        
+        for link in search(query, num_results=num_results):
+            text = fetch_webpage_text(link)
+            if text:
+                results.append(f"**website:** {link}\n**extracted text:** {text}\n")
+                
+        if results:
+            return "\n".join(results)
+        else:
+            return 'not found'
+    
+    def lange_search(q: str, count: int = 3, freshness: str = "noLimit"):
+        try:
+            url = "https://api.langsearch.com/v1/web-search"
+    
+            payload = json.dumps({
+                "query": q,
+                "freshness": freshness,
+                "summary": True,
+                "count": count
+            })
+            headers = {
+                'Authorization': 'Bearer sk-6c026765790543a2b8665325dd8893e1',
+                'Content-Type': 'application/json'
+            }
+    
+            response = requests.request("POST", url, headers=headers, data=payload)
+    
+            result = ''
+            for name, data_dict in response.json()['data']['webPages']['value'][0].items():
+                data_dict = (data_dict.replace('\n', '') if data_dict.count('\n') > 10 else data_dict) if type(data_dict) == str else data_dict
+                result += f'- **{name}:** {data_dict}\n'
+        except Exception as e:
+            result = str(e)
+    
+        return result
+
     async def web_search(self, content):
         if self.internet_search or self.google_search:
             icon = 'https://lh3.googleusercontent.com/COxitqgJr1sJnIDe8-jiKhxDx1FrYbtRHKJ9z_hELisAlapwE9LUPh6fcXIfb5vwpbMl4xl9H9TRFPc5NOO8Sb3VSgIBrfRYvW6cUA'
             if self.internet_search:
-                result = web_search.lange_search(content)
+                result = self.lange_search(content)
                 icon = 'https://cdn-icons-png.flaticon.com/512/1011/1011322.png'
             elif self.google_search:
                 self.google_search = not self.google_search
-                result = web_search.google_search(content)
+                result = self.google_search(content)
 
             self.messages.append({"role": "user", "system": "web search results (the user has enabled web search):\n" + str(result)})
             self.results['embeds'].append(
